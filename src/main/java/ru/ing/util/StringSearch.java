@@ -4,130 +4,182 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.regex.Pattern;
 
 public class StringSearch {
 
-    public static final Pattern VALID_LINE_PATTERN =
-            Pattern.compile("^(\"[^\"]*(\"{2}[^\"]*)*\";)*\"[^\"]*(\"{2}[^\"]*)*\"$");
-
     public void processData(String fileName) throws IOException {
-        Map<String, Set<Integer>> columnValueToGroupIds = new HashMap<>();
-        List<Set<List<String>>> groups = new ArrayList<>();
+        Map<String, Integer> valueToGroupId = new HashMap<>();
+        List<Set<String>> groups = new ArrayList<>();
+        Map<Integer, Set<Integer>> groupConnections = new HashMap<>();
 
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(new FileInputStream(fileName), StandardCharsets.UTF_8))) {
 
             String line;
             while ((line = br.readLine()) != null) {
+
                 if (isValidLine(line)) {
                     List<String> record = parseRecord(line);
-                    processRecord(record, columnValueToGroupIds, groups);
+                    processRecord(record, valueToGroupId, groups, groupConnections);
                 }
             }
         }
 
-        writeResultsToFile(groups);
+        List<Set<String>> mergedGroups = mergeConnectedGroups(groups, groupConnections);
+        writeResultsToFile(mergedGroups);
     }
 
     private void processRecord(List<String> record,
-                               Map<String, Set<Integer>> columnValueToGroupIds,
-                               List<Set<List<String>>> groups) {
+                               Map<String, Integer> valueToGroupId,
+                               List<Set<String>> groups,
+                               Map<Integer, Set<Integer>> groupConnections) {
+
+        String recordStr = String.join(";", record);
         Set<Integer> matchingGroupIds = new HashSet<>();
 
         for (int colIndex = 0; colIndex < record.size(); colIndex++) {
             String value = record.get(colIndex);
             if (!value.isEmpty()) {
                 String key = colIndex + ":" + value;
-                Set<Integer> groupIds = columnValueToGroupIds.get(key);
-                if (groupIds != null) {
-                    matchingGroupIds.addAll(groupIds);
+                Integer groupId = valueToGroupId.get(key);
+                if (groupId != null) {
+                    matchingGroupIds.add(groupId);
                 }
             }
         }
 
         if (matchingGroupIds.isEmpty()) {
-            Set<List<String>> newGroup = new HashSet<>();
-            newGroup.add(record);
+            Set<String> newGroup = new HashSet<>();
+            newGroup.add(recordStr);
             groups.add(newGroup);
             int newGroupId = groups.size() - 1;
 
-            addKeysForRecord(record, newGroupId, columnValueToGroupIds);
-        } else {
-            List<Integer> sortedGroupIds = new ArrayList<>(matchingGroupIds);
-            sortedGroupIds.sort(Collections.reverseOrder());
-
-            int mainGroupId = sortedGroupIds.get(0);
-            Set<List<String>> mainGroup = groups.get(mainGroupId);
-            mainGroup.add(record);
-
-            for (int i = 1; i < sortedGroupIds.size(); i++) {
-                int groupIdToMerge = sortedGroupIds.get(i);
-                Set<List<String>> groupToMerge = groups.get(groupIdToMerge);
-                mainGroup.addAll(groupToMerge);
-
-                updateGroupReferences(groupToMerge, groupIdToMerge, mainGroupId, columnValueToGroupIds);
-
-                groups.set(groupIdToMerge, null);
-            }
-
-            addKeysForRecord(record, mainGroupId, columnValueToGroupIds);
-        }
-    }
-
-    private void addKeysForRecord(List<String> record, int groupId,
-                                  Map<String, Set<Integer>> columnValueToGroupIds) {
-        for (int colIndex = 0; colIndex < record.size(); colIndex++) {
-            String value = record.get(colIndex);
-            if (!value.isEmpty()) {
-                String key = colIndex + ":" + value;
-                columnValueToGroupIds
-                        .computeIfAbsent(key, k -> new HashSet<>())
-                        .add(groupId);
-            }
-        }
-    }
-
-    private void updateGroupReferences(Set<List<String>> group, int oldGroupId, int newGroupId,
-                                       Map<String, Set<Integer>> columnValueToGroupIds) {
-        for (List<String> record : group) {
             for (int colIndex = 0; colIndex < record.size(); colIndex++) {
                 String value = record.get(colIndex);
                 if (!value.isEmpty()) {
                     String key = colIndex + ":" + value;
-                    Set<Integer> groupIds = columnValueToGroupIds.get(key);
-                    if (groupIds != null) {
-                        groupIds.remove(oldGroupId);
-                        groupIds.add(newGroupId);
-                    }
+                    valueToGroupId.put(key, newGroupId);
+                }
+            }
+        } else if (matchingGroupIds.size() == 1) {
+            int groupId = matchingGroupIds.iterator().next();
+            groups.get(groupId).add(recordStr);
+
+            for (int colIndex = 0; colIndex < record.size(); colIndex++) {
+                String value = record.get(colIndex);
+                if (!value.isEmpty()) {
+                    String key = colIndex + ":" + value;
+                    valueToGroupId.put(key, groupId);
+                }
+            }
+        } else {
+            List<Integer> sortedGroupIds = new ArrayList<>(matchingGroupIds);
+            int mainGroupId = sortedGroupIds.get(0);
+
+            groups.get(mainGroupId).add(recordStr);
+
+            for (int i = 1; i < sortedGroupIds.size(); i++) {
+                int otherGroupId = sortedGroupIds.get(i);
+                groupConnections.computeIfAbsent(mainGroupId, k -> new HashSet<>())
+                        .add(otherGroupId);
+                groupConnections.computeIfAbsent(otherGroupId, k -> new HashSet<>())
+                        .add(mainGroupId);
+            }
+
+            for (int colIndex = 0; colIndex < record.size(); colIndex++) {
+                String value = record.get(colIndex);
+                if (!value.isEmpty()) {
+                    String key = colIndex + ":" + value;
+                    valueToGroupId.put(key, mainGroupId);
                 }
             }
         }
     }
 
-    protected List<String> parseRecord(String line) {
-        String[] values = line.split(";");
-        List<String> result = new ArrayList<>(values.length);
-        for (String value : values) {
-            if (value.startsWith("\"") && value.endsWith("\"")) {
-                result.add(value.substring(1, value.length() - 1).replace("\"\"", "\""));
-            } else {
-                result.add(value);
+    private List<Set<String>> mergeConnectedGroups(List<Set<String>> groups,
+                                                   Map<Integer, Set<Integer>> connections) {
+        boolean[] visited = new boolean[groups.size()];
+        List<Set<String>> result = new ArrayList<>();
+        Map<Integer, Integer> oldToNewGroupId = new HashMap<>();
+
+        for (int i = 0; i < groups.size(); i++) {
+            if (!visited[i] && groups.get(i) != null) {
+                Set<String> mergedGroup = new HashSet<>();
+                Queue<Integer> queue = new LinkedList<>();
+                queue.add(i);
+                visited[i] = true;
+
+                while (!queue.isEmpty()) {
+                    int currentId = queue.poll();
+                    mergedGroup.addAll(groups.get(currentId));
+                    oldToNewGroupId.put(currentId, result.size());
+
+                    Set<Integer> connected = connections.get(currentId);
+                    if (connected != null) {
+                        for (int connectedId : connected) {
+                            if (!visited[connectedId]) {
+                                visited[connectedId] = true;
+                                queue.add(connectedId);
+                            }
+                        }
+                    }
+                }
+
+                result.add(mergedGroup);
             }
         }
+
+        return result;
+    }
+
+    protected List<String> parseRecord(String line) {
+        List<String> result = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    current.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (c == ';' && !inQuotes) {
+                result.add(current.toString());
+                current = new StringBuilder();
+            } else {
+                current.append(c);
+            }
+        }
+        result.add(current.toString());
+
         return result;
     }
 
     protected static boolean isValidLine(String line) {
-        return VALID_LINE_PATTERN.matcher(line).matches();
+        if (line == null || line.trim().isEmpty()) {
+            return false;
+        }
+
+        int quoteCount = 0;
+        for (char c : line.toCharArray()) {
+            if (c == '"') {
+                quoteCount++;
+            }
+        }
+
+        return quoteCount % 2 == 0 && line.contains("\"");
     }
 
-    protected void writeResultsToFile(List<Set<List<String>>> groups) throws IOException {
+    protected void writeResultsToFile(List<Set<String>> groups) throws IOException {
         SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMdd_HHmm");
         String filename = "output_" + dateFormat.format(new Date()) + ".txt";
 
-        List<Set<List<String>>> validGroups = new ArrayList<>();
-        for (Set<List<String>> group : groups) {
+        List<Set<String>> validGroups = new ArrayList<>();
+        for (Set<String> group : groups) {
             if (group != null && group.size() > 1) {
                 validGroups.add(group);
             }
@@ -142,10 +194,10 @@ public class StringSearch {
             writer.write("\n-------------------------\n");
 
             int groupNumber = 1;
-            for (Set<List<String>> group : validGroups) {
+            for (Set<String> group : validGroups) {
                 writer.write("Группа " + groupNumber + ":\n");
-                for (List<String> record : group) {
-                    writer.write(String.join(";", record) + "\n");
+                for (String record : group) {
+                    writer.write(record + "\n");
                 }
                 writer.write("\n");
                 groupNumber++;
